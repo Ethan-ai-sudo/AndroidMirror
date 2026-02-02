@@ -27,5 +27,11 @@
 
     <string name="need_register">需要注册</string>
     <string name="power_button">电源</string>
+    <string-array name="options_delay_keys">
+        <item>高 (100ms)</item>
+        <item>中 (60ms)</item>
+        <item>低 (30ms)</item>
+    </string-array>
+
 </resources>
 

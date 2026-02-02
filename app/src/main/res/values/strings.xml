@@ -30,6 +30,7 @@
     <string name="need_register">Registration required</string>
 
     <string-array name="options_resolution_values">
+        <item>2560x1440</item>
         <item>1920x1080</item>
         <item>1600x720</item>
         <item>1280x720</item>

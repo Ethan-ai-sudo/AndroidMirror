@@ -24,6 +24,7 @@
   <string name="connection_cancelled">接続がキャンセルされました</string>
   <string name="need_register">登録が必要です</string>
   <string-array name="options_resolution_values">
+    <item>2560x1440</item>
     <item>1920x1080</item>
     <item>1600x720</item>
     <item>1280x720</item>
@@ -48,11 +49,6 @@
     <item>2 Mbps</item>
     <item>1 Mbps</item>
   </string-array>
-  <integer-array name="options_bitrate_values">
-    <item>6144000</item>
-    <item>4096000</item>
-    <item>2048000</item>
-    <item>1024000</item>
-  </integer-array>
+
     <string name="power_button">電源</string>
 </resources>
