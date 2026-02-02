@@ -2,11 +2,11 @@
 
 apply plugin: 'com.android.application'
 android {
-    namespace 'org.server.scrcpy'
+    namespace 'xyz.server.scrcpy'
 
     compileSdkVersion 33
     defaultConfig {
-        applicationId "org.server.scrcpy"
+        applicationId "xyz.server.scrcpy"
         minSdkVersion 21
         targetSdkVersion 33
         versionCode version_code

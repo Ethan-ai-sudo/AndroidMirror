@@ -111,22 +111,12 @@ public class SendCommands {
 
         // 先杀死可能存在的旧 scrcpy server 进程，避免端口占用 (address used) 问题
         Log.i("Scrcpy", "Killing old scrcpy server process if exists...");
-        // 使用多种兼容的方式杀死旧进程，分步执行以确保生效
-        // 步骤1：使用 pkill
-        App.adbCmd("-s", targetDevice, "shell", "pkill", "-9", "-f", "org.server.scrcpy");
-        App.adbCmd("-s", targetDevice, "shell", "pkill", "-9", "-f", "scrcpy-server");
-        
-        // 步骤2：查找并杀死 app_process 中运行的 scrcpy 进程
-        String findAndKillCmd = 
-                "ps -A -o PID,ARGS 2>/dev/null | grep -E 'app_process.*scrcpy' | grep -v grep | while read pid rest; do kill -9 $pid 2>/dev/null; done; " +
-                "ps -o PID,ARGS 2>/dev/null | grep -E 'app_process.*scrcpy' | grep -v grep | while read pid rest; do kill -9 $pid 2>/dev/null; done; " +
-                "ps 2>/dev/null | grep -E 'app_process.*scrcpy' | grep -v grep | while read line; do echo $line | awk '{print $2}' | xargs kill -9 2>/dev/null; done";
-        App.adbCmd("-s", targetDevice, "shell", "sh", "-c", findAndKillCmd);
-        
-        // 步骤3：直接通过 /proc 查找并杀死进程（最兼容的方式）
+
+        App.adbCmd("-s", targetDevice, "shell", "pkill", "-9", "-f", "xyz.server.scrcpy");
+
         String procKillCmd = 
                 "for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do " +
-                "  if cat /proc/$pid/cmdline 2>/dev/null | tr '\\0' ' ' | grep -q 'org.server.scrcpy'; then " +
+                "  if cat /proc/$pid/cmdline 2>/dev/null | tr '\\0' ' ' | grep -q 'xyz.server.scrcpy'; then " +
                 "    kill -9 $pid 2>/dev/null; " +
                 "  fi; " +
                 "done";
@@ -168,7 +158,7 @@ public class SendCommands {
         String ipArg = "/" + localip;
         String startCmd = "echo shell_start >/data/local/tmp/scrcpy.shell; "
                 + "export CLASSPATH=/data/local/tmp/scrcpy-server.jar; "
-                + "/system/bin/app_process / org.server.scrcpy.Server "
+                + "/system/bin/app_process / xyz.server.scrcpy.Server "
                 + ipArg + " " + size + " " + bitrate + " false " + audioEnabled
                 + " >/data/local/tmp/scrcpy.log 2>&1 &";
         App.adbCmd("-s", targetDevice, "shell", "sh", "-c", startCmd);
