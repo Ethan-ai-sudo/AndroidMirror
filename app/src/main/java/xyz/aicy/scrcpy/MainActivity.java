@@ -3,6 +3,7 @@ package xyz.aicy.scrcpy;
 import android.annotation.SuppressLint;
 import androidx.annotation.NonNull;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -30,15 +31,20 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewConfiguration;
+import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
+import android.widget.BaseAdapter;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListPopupWindow;
+import android.widget.ListView;
 import android.widget.Spinner;
 import android.widget.Switch;
+import android.widget.TextView;
 import android.widget.Toast;
 import xyz.aicy.scrcpy.utils.PreUtils;
 import xyz.aicy.scrcpy.utils.Progress;
@@ -51,6 +57,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
 import android.os.Handler;
 import android.os.Looper;
 
@@ -303,23 +310,161 @@ public class MainActivity extends Activity implements Scrcpy.ServiceCallbacks, S
     }
 
     private void showListPopulWindow(EditText mEditText) {
-        String[] list = getHistoryList();//要填充的数据
-        if (list.length == 0) {  // 如果list为空，则使用本机填充一个
-            list = new String[]{"127.0.0.1"};
+        String[] list = getHistoryList();
+        if (list.length == 0) {
+            Toast.makeText(context, R.string.no_history, Toast.LENGTH_SHORT).show();
+            return;
         }
-        final ListPopupWindow listPopupWindow;
-        listPopupWindow = new ListPopupWindow(this);
-        listPopupWindow.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, list));//用android内置布局，或设计自己的样式
-        listPopupWindow.setAnchorView(mEditText);//以哪个控件为基准，在该处以mEditText为基准
-        listPopupWindow.setModal(true);
-        listPopupWindow.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
 
-        String[] finalList = list;
-        listPopupWindow.setOnItemClickListener((adapterView, view, i, l) -> {
-            mEditText.setText(finalList[i]);
-            listPopupWindow.dismiss();
+        AlertDialog[] dialogHolder = new AlertDialog[1];
+        HistoryAdapter adapter = new HistoryAdapter(context, list, dialogHolder, mEditText);
+
+        View dialogView = View.inflate(context, R.layout.dialog_history, null);
+        ListView listView = dialogView.findViewById(R.id.history_list_view);
+        View emptyState = dialogView.findViewById(R.id.empty_state);
+        TextView countText = dialogView.findViewById(R.id.dialog_count);
+        View closeBtn = dialogView.findViewById(R.id.btn_close);
+
+        listView.setAdapter(adapter);
+        listView.setEmptyView(emptyState);
+        countText.setText(list.length + "");
+        adapter.setCountText(countText);
+        adapter.setEmptyState(emptyState);
+
+        closeBtn.setOnClickListener(v -> {
+            if (dialogHolder[0] != null) {
+                dialogHolder[0].dismiss();
+            }
         });
-        listPopupWindow.show();
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(context, R.style.HistoryDialogTheme);
+        builder.setView(dialogView);
+        dialogHolder[0] = builder.show();
+    }
+
+    private void deleteHistoryItem(int index) {
+        String[] historyList = getHistoryList();
+        if (index < 0 || index >= historyList.length) {
+            return;
+        }
+        JSONArray newJson = new JSONArray();
+        for (int i = 0; i < historyList.length; i++) {
+            if (i != index) {
+                newJson.put(historyList[i]);
+            }
+        }
+        PreUtils.put(context, Constant.HISTORY_LIST_KEY, newJson.toString());
+    }
+
+    private class HistoryAdapter extends BaseAdapter {
+        private final Context mAdapterContext;
+        private final ArrayList<String> devices;
+        private final AlertDialog[] dialogHolder;
+        private final EditText editText;
+        private TextView countText;
+        private View emptyState;
+
+        HistoryAdapter(Context context, String[] list, AlertDialog[] dialogHolder, EditText editText) {
+            this.mAdapterContext = context;
+            this.devices = new ArrayList<>();
+            for (String s : list) {
+                this.devices.add(s);
+            }
+            this.dialogHolder = dialogHolder;
+            this.editText = editText;
+        }
+
+        void setCountText(TextView countText) {
+            this.countText = countText;
+        }
+
+        void setEmptyState(View emptyState) {
+            this.emptyState = emptyState;
+        }
+
+        @Override
+        public int getCount() {
+            return devices.size();
+        }
+
+        @Override
+        public String getItem(int position) {
+            return devices.get(position);
+        }
+
+        @Override
+        public long getItemId(int position) {
+            return position;
+        }
+
+        @Override
+        public View getView(int position, View convertView, ViewGroup parent) {
+            ViewHolder holder;
+            if (convertView == null) {
+                convertView = View.inflate(mAdapterContext, R.layout.item_history, null);
+                holder = new ViewHolder();
+                holder.textView = convertView.findViewById(R.id.history_text);
+                holder.deleteBtn = convertView.findViewById(R.id.history_delete);
+                convertView.setTag(holder);
+            } else {
+                holder = (ViewHolder) convertView.getTag();
+            }
+
+            String device = getItem(position);
+            holder.textView.setText(device);
+
+            convertView.setOnClickListener(v -> {
+                editText.setText(device);
+                if (dialogHolder[0] != null) {
+                    dialogHolder[0].dismiss();
+                }
+            });
+
+            holder.deleteBtn.setOnClickListener(v -> {
+                View confirmView = View.inflate(mAdapterContext, R.layout.dialog_delete_confirm, null);
+                TextView deviceText = confirmView.findViewById(R.id.delete_device_text);
+                View cancelBtn = confirmView.findViewById(R.id.btn_cancel);
+                View deleteBtn = confirmView.findViewById(R.id.btn_delete);
+
+                deviceText.setText(device);
+
+                AlertDialog[] confirmHolder = new AlertDialog[1];
+                AlertDialog.Builder confirmBuilder = new AlertDialog.Builder(mAdapterContext, R.style.HistoryDialogTheme);
+                confirmBuilder.setView(confirmView);
+                confirmHolder[0] = confirmBuilder.show();
+
+                cancelBtn.setOnClickListener(cv -> {
+                    if (confirmHolder[0] != null) {
+                        confirmHolder[0].dismiss();
+                    }
+                });
+
+                deleteBtn.setOnClickListener(dv -> {
+                    int pos = devices.indexOf(device);
+                    if (pos >= 0) {
+                        deleteHistoryItem(pos);
+                        devices.remove(pos);
+                        notifyDataSetChanged();
+                        if (countText != null) {
+                            countText.setText(devices.size() + "");
+                        }
+                        if (devices.isEmpty() && emptyState != null) {
+                            emptyState.setVisibility(View.VISIBLE);
+                        }
+                    }
+                    if (confirmHolder[0] != null) {
+                        confirmHolder[0].dismiss();
+                    }
+                });
+            });
+
+            return convertView;
+        }
+
+        private class ViewHolder {
+            TextView textView;
+            ImageView deleteBtn;
+        }
     }
 
     public void get_saved_preferences() {

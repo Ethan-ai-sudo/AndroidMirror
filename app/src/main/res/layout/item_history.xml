@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingLeft="12dp"
+    android:paddingRight="12dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="52dp"
+        android:background="@drawable/history_item_ripple"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingLeft="14dp"
+        android:paddingRight="6dp">
+
+        <!-- IP icon -->
+        <ImageView
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:layout_marginRight="12dp"
+            android:src="@drawable/ic_history_ip" />
+
+        <!-- Device address -->
+        <TextView
+            android:id="@+id/history_text"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:textColor="#E6FFFFFF"
+            android:textSize="15sp" />
+
+        <!-- Delete button -->
+        <ImageView
+            android:id="@+id/history_delete"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:background="@drawable/history_delete_ripple"
+            android:contentDescription="@string/delete"
+            android:padding="8dp"
+            android:src="@drawable/ic_history_delete" />
+
+    </LinearLayout>
+
+</LinearLayout>

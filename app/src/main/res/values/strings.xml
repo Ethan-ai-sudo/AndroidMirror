@@ -17,6 +17,13 @@
     <string name="switch_audio_forward">Audio forwarding</string>
     <string name="switch_capture_keys">Capture Volume keys</string>
 
+    <string name="history_title">Connection History</string>
+    <string name="delete">Delete</string>
+    <string name="confirm_delete">Confirm Delete</string>
+    <string name="cancel">Cancel</string>
+    <string name="close">Close</string>
+    <string name="no_history">No history records</string>
+
     <string name="connect_tips">Tips: You need to enable wireless debugging on your phone\n\t\tReset adb port command: adb tcpip 5555</string>
     <string name="please_wait">Connecting …</string>
 
