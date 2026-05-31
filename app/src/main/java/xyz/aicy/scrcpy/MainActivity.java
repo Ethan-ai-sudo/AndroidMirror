@@ -282,20 +282,12 @@ public class MainActivity extends Activity implements Scrcpy.ServiceCallbacks, S
         landscape = false;  // 将模式重新置为 竖屏，模式不正确将导致连接黑屏
         setContentView(R.layout.activity_main);
         final Button startButton = findViewById(R.id.button_start);
-        // final Button floatButton = findViewById(R.id.button_start_float);
-
         sendCommands = new SendCommands();
 
         startButton.setOnClickListener(v -> {
-            // local_ip = wifiIpAddress();
             getAttributes();
             connectScrcpyServer(serverAdr);
         });
-
-//        floatButton.setOnClickListener(v -> {
-//            getAttributes();
-//            showDisplayWindow();
-//        });
         get_saved_preferences();
 
         EditText editText = findViewById(R.id.editText_server_host);
@@ -1360,24 +1352,17 @@ public class MainActivity extends Activity implements Scrcpy.ServiceCallbacks, S
     protected void connectExitExt(boolean userDisconnect) {
         if (!userDisconnect) {  // userDisconnect : 用户主动断开连接
             errorCount += 1;
-            // errorCount = 0;
             Log.i("Scrcpy", "连接错误次数: " + errorCount);
-            // 错误 3 次，则重启 adb 服务
             if (errorCount >= 3) {
                 App.startAdbServer();
             }
         }
-        // 如果是无头模式，自行弹出重连选项
         if (headlessMode && !resumeScrcpy && !result_of_Rotation) {
-            // 非用户主动断开、非页面切换、非横竖屏切换，才会自动弹出断连提示
             if (!userDisconnect) {
                 Dialog.displayDialog(this, getString(R.string.connect_faild),
                         getString(R.string.connect_faild_ask), () -> {
-                            // 重试连接
                             connectScrcpyServer(PreUtils.get(context, Constant.CONTROL_REMOTE_ADDR, ""));
                         }, () -> {
-
-                            // 取消重试
                             finishAndRemoveTask();
                         });
             } else {
