@@ -18,4 +18,7 @@ public class Constant {
     public static final String HISTORY_LIST_KEY = "history_list_key";
     public static final String USER_ID = "user_id";
 
+    // 每台设备的独立配置前缀
+    public static final String DEVICE_CONFIG_PREFIX = "device_config_";
+
 }

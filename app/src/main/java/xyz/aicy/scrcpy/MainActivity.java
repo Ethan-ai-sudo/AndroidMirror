@@ -52,6 +52,7 @@ import xyz.aicy.scrcpy.utils.ThreadUtils;
 import xyz.aicy.scrcpy.utils.Util;
 import org.json.JSONArray;
 import org.json.JSONException;
+import org.json.JSONObject;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -60,6 +61,8 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.TextWatcher;
+import android.text.Editable;
 
 
 public class MainActivity extends Activity implements Scrcpy.ServiceCallbacks, SensorEventListener {
@@ -79,6 +82,9 @@ public class MainActivity extends Activity implements Scrcpy.ServiceCallbacks, S
     private boolean resumeScrcpy = false;
     // 是否正在连接中（用于返回手势取消连接）
     private volatile boolean isConnecting = false;
+    // 防止程序化 setText 触发 TextWatcher
+    private boolean isSettingText = false;
+    private String previousDeviceAddr = "";
     SensorManager sensorManager;
     private SendCommands sendCommands;
     private int videoBitrate;
@@ -354,6 +360,8 @@ public class MainActivity extends Activity implements Scrcpy.ServiceCallbacks, S
         if (index < 0 || index >= historyList.length) {
             return;
         }
+        // 同时清除该设备的独立配置
+        PreUtils.remove(context, Constant.DEVICE_CONFIG_PREFIX + historyList[index]);
         JSONArray newJson = new JSONArray();
         for (int i = 0; i < historyList.length; i++) {
             if (i != index) {
@@ -422,6 +430,7 @@ public class MainActivity extends Activity implements Scrcpy.ServiceCallbacks, S
 
             convertView.setOnClickListener(v -> {
                 editText.setText(device);
+                loadDeviceConfig(device);
                 if (dialogHolder[0] != null) {
                     dialogHolder[0].dismiss();
                 }
@@ -504,25 +513,28 @@ public class MainActivity extends Activity implements Scrcpy.ServiceCallbacks, S
         setSpinner(R.array.options_resolution_values, R.id.spinner_video_resolution, Constant.PREFERENCE_SPINNER_RESOLUTION);
         setSpinner(R.array.options_bitrate_keys, R.id.spinner_video_bitrate, Constant.PREFERENCE_SPINNER_BITRATE);
         setSpinner(R.array.options_delay_keys, R.id.delay_control_spinner, Constant.PREFERENCE_SPINNER_DELAY);
+
+        // 如果有该设备的专属配置，覆盖全局配置
+        String currentAddr = editTextServerHost.getText().toString();
+        if (!TextUtils.isEmpty(currentAddr)) {
+            loadDeviceConfig(currentAddr.trim());
+        }
+
         if (aSwitch0.isChecked()) {
             aSwitch1.setClickable(false);
             aSwitch1.setTextColor(Color.GRAY);
-            // aSwitch1.setVisibility(View.GONE);
         }
 
         aSwitch0.setOnClickListener(v -> {
             if (aSwitch0.isChecked()) {
                 aSwitch1.setClickable(false);
                 aSwitch1.setTextColor(Color.GRAY);
-                // aSwitch1.setVisibility(View.GONE);
             } else {
                 aSwitch1.setClickable(true);
                 aSwitch1.setTextColor(Color.WHITE);
-                // aSwitch1.setVisibility(View.VISIBLE);
             }
         });
 
-        // Handle screen off switch change
         switchScreenOff.setOnCheckedChangeListener((buttonView, isChecked) -> {
             Log.d("Scrcpy", "switch_screen_off changed: " + isChecked);
             boolean hasConnection = scrcpy != null && scrcpy.check_socket_connection();
@@ -530,6 +542,28 @@ public class MainActivity extends Activity implements Scrcpy.ServiceCallbacks, S
             if (isChecked && hasConnection) {
                 // When switch is turned on, send screen off command
                 scrcpy.sendScreenOffCommand();
+            }
+        });
+
+        previousDeviceAddr = editTextServerHost.getText().toString().trim();
+        editTextServerHost.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {}
+
+            @Override
+            public void afterTextChanged(Editable s) {
+                if (isSettingText) {
+                    return;
+                }
+                String newAddr = s.toString().trim();
+                if (!newAddr.isEmpty() && !newAddr.equals(previousDeviceAddr)) {
+                    saveDeviceConfig(previousDeviceAddr);
+                    loadDeviceConfig(newAddr);
+                    previousDeviceAddr = newAddr;
+                }
             }
         });
     }
@@ -763,6 +797,9 @@ public class MainActivity extends Activity implements Scrcpy.ServiceCallbacks, S
         PreUtils.put(context, Constant.CONTROL_SCREEN_OFF, screenOff);
         PreUtils.put(context, Constant.CONTROL_AUDIO, audioForward);
 
+        // 保存该设备的独立配置
+        saveDeviceConfig(serverAdr);
+
         final String[] videoResolutions = getResources().getStringArray(R.array.options_resolution_values)[videoResolutionSpinner.getSelectedItemPosition()].split("x");
         screenHeight = Integer.parseInt(videoResolutions[0]);
         screenWidth = Integer.parseInt(videoResolutions[1]);
@@ -820,6 +857,90 @@ public class MainActivity extends Activity implements Scrcpy.ServiceCallbacks, S
             Log.e("Scrcpy", "Failed to save history list", e);
         }
         return false;
+    }
+
+    /**
+     * 保存指定设备的配置到 SharedPreferences
+     */
+    private void saveDeviceConfig(String device) {
+        if (TextUtils.isEmpty(device) || headlessMode) {
+            return;
+        }
+        try {
+            final Switch aSwitch0 = findViewById(R.id.switch0);
+            final Switch aSwitch1 = findViewById(R.id.switch1);
+            final Switch switchScreenOff = findViewById(R.id.switch_screen_off);
+            final Switch switchAudioForward = findViewById(R.id.switch_audio_forward);
+            final Spinner resSpinner = findViewById(R.id.spinner_video_resolution);
+            final Spinner bitrateSpinner = findViewById(R.id.spinner_video_bitrate);
+            final Spinner delaySpinner = findViewById(R.id.delay_control_spinner);
+
+            JSONObject config = new JSONObject();
+            config.put("no_control", aSwitch0.isChecked());
+            config.put("nav", aSwitch1.isChecked());
+            config.put("screen_off", switchScreenOff.isChecked());
+            config.put("audio", switchAudioForward.isChecked());
+            config.put("resolution", resSpinner.getSelectedItemPosition());
+            config.put("bitrate", bitrateSpinner.getSelectedItemPosition());
+            config.put("delay", delaySpinner.getSelectedItemPosition());
+
+            PreUtils.put(context, Constant.DEVICE_CONFIG_PREFIX + device, config.toString());
+        } catch (Exception e) {
+            Log.e("Scrcpy", "Failed to save device config for " + device, e);
+        }
+    }
+
+    /**
+     * 加载指定设备的配置并应用到 UI
+     */
+    private void loadDeviceConfig(String device) {
+        if (TextUtils.isEmpty(device)) {
+            return;
+        }
+        String configStr = PreUtils.get(context, Constant.DEVICE_CONFIG_PREFIX + device, "");
+        if (TextUtils.isEmpty(configStr)) {
+            return;
+        }
+        try {
+            JSONObject config = new JSONObject(configStr);
+
+            final Switch aSwitch0 = findViewById(R.id.switch0);
+            final Switch aSwitch1 = findViewById(R.id.switch1);
+            final Switch switchScreenOff = findViewById(R.id.switch_screen_off);
+            final Switch switchAudioForward = findViewById(R.id.switch_audio_forward);
+            final Spinner resSpinner = findViewById(R.id.spinner_video_resolution);
+            final Spinner bitrateSpinner = findViewById(R.id.spinner_video_bitrate);
+            final Spinner delaySpinner = findViewById(R.id.delay_control_spinner);
+
+            aSwitch0.setChecked(config.optBoolean("no_control", false));
+            aSwitch1.setChecked(config.optBoolean("nav", false));
+            switchScreenOff.setChecked(config.optBoolean("screen_off", false));
+            switchAudioForward.setChecked(config.optBoolean("audio", true));
+
+            int resPos = config.optInt("resolution", 0);
+            if (resPos >= 0 && resPos < resSpinner.getCount()) {
+                resSpinner.setSelection(resPos);
+            }
+            int bitratePos = config.optInt("bitrate", 0);
+            if (bitratePos >= 0 && bitratePos < bitrateSpinner.getCount()) {
+                bitrateSpinner.setSelection(bitratePos);
+            }
+            int delayPos = config.optInt("delay", 0);
+            if (delayPos >= 0 && delayPos < delaySpinner.getCount()) {
+                delaySpinner.setSelection(delayPos);
+            }
+
+            // 同步 UI 联动状态
+            if (aSwitch0.isChecked()) {
+                aSwitch1.setClickable(false);
+                aSwitch1.setTextColor(Color.GRAY);
+            } else {
+                aSwitch1.setClickable(true);
+                aSwitch1.setTextColor(Color.WHITE);
+            }
+        } catch (Exception e) {
+            Log.e("Scrcpy", "Failed to load device config for " + device, e);
+        }
     }
 
     @SuppressLint("SuspiciousNameCombination")
