@@ -331,6 +331,13 @@ public class MainActivity extends Activity implements Scrcpy.ServiceCallbacks, S
         adapter.setCountText(countText);
         adapter.setEmptyState(emptyState);
 
+        // 限制列表最多展示 10 条，超过需滚动
+        int itemHeight = (int) (52 * getResources().getDisplayMetrics().density);
+        int maxHeight = itemHeight * Math.min(list.length, 10);
+        ViewGroup.LayoutParams lp = listView.getLayoutParams();
+        lp.height = maxHeight;
+        listView.setLayoutParams(lp);
+
         closeBtn.setOnClickListener(v -> {
             if (dialogHolder[0] != null) {
                 dialogHolder[0].dismiss();
@@ -444,6 +451,14 @@ public class MainActivity extends Activity implements Scrcpy.ServiceCallbacks, S
                     if (pos >= 0) {
                         deleteHistoryItem(pos);
                         devices.remove(pos);
+                        if (device.equals(editText.getText().toString())) {
+                            if (!devices.isEmpty()) {
+                                editText.setText(devices.get(0));
+                            } else {
+                                editText.setText("");
+                            }
+                            PreUtils.put(context, Constant.CONTROL_REMOTE_ADDR, "");
+                        }
                         notifyDataSetChanged();
                         if (countText != null) {
                             countText.setText(devices.size() + "");
