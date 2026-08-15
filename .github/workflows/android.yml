@@ -7,50 +7,63 @@ on:
       - "v*"
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
-        cache: gradle
+      - uses: actions/checkout@v4
 
-    - name: Decode Keystore
-      env:
-        ENCODED_STRING: ${{ secrets.SIGNING_KEY }}  # Uses the encoded signing key stored in GitHub Secrets.
-      run: |
-        echo $ENCODED_STRING | base64 -di > app/scrcpy.jks
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
 
-    - name: Grant execute permission for gradlew
-      run: chmod +x gradlew
-    - name: Build with Gradle
-      run: ./gradlew assembleScrcpyRelease
-      env:
-        SIGNING_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
-        SIGNING_KEY_ALIAS: ${{ secrets.ALIAS }}
-        SIGNING_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
-    - name: Upload Signed Release APK
-      uses: actions/upload-artifact@v4
-      with:
-        name: ScrcpyForAndroid-signed-release
-        path: |
-          app/build/outputs/apk/scrcpy/release/*.apk
-        retention-days: 90  # Sets the artifact retention period to 90 days.
+      - name: Accept licenses
+        run: |
+          yes | sdkmanager --licenses
 
-    - name: Publish GitHub Release
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v2
-      with:
-        name: ${{ github.ref_name }}
-        files: app/build/outputs/apk/scrcpy/release/*.apk
+      - name: Install build tools
+        run: |
+          sdkmanager --install "build-tools;33.0.2"
+          sdkmanager --install "platforms;android-33"
+          sdkmanager --install "cmdline-tools;latest"
+
+      # WireGuard 同源方式：用仓库里提交的 debug.keystore 给 release 签名，
+      # 不依赖任何 GitHub Secrets；每次产物签名一致，可正常覆盖安装更新。
+      - name: Use committed debug keystore for release signing
+        run: |
+          cp .signing/debug.keystore app/scrcpy.jks
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build with Gradle
+        run: ./gradlew assembleScrcpyRelease
+        env:
+          SIGNING_STORE_PASSWORD: android
+          SIGNING_KEY_ALIAS: androiddebugkey
+          SIGNING_KEY_PASSWORD: android
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AndroidMirror-release
+          path: app/build/outputs/apk/scrcpy/release/*.apk
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: app/build/outputs/apk/scrcpy/release/*.apk

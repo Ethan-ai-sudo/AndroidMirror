@@ -25,8 +25,8 @@ import java.io.OutputStream;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
-import java.util.LinkedList;
-import java.util.Queue;
+import java.net.SocketTimeoutException;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 
@@ -45,8 +45,9 @@ public class Scrcpy extends Service {
     private int screenWidth;
     private int screenHeight;
 
-    private final Queue<byte[]> event = new LinkedList<byte[]>();
-    // private byte[] event = null;
+    // C5: thread-safe unbounded queue — UI threads offer() (never blocks), the dedicated
+    // ControlSender thread take()s. Replaces the non-thread-safe LinkedList + serial send.
+    private final LinkedBlockingQueue<byte[]> event = new LinkedBlockingQueue<>();
     private VideoDecoder videoDecoder;
     private AudioDecoder audioDecoder;
     private boolean audioEnabled = true;
@@ -65,6 +66,10 @@ public class Scrcpy extends Service {
     private volatile byte[] cachedKeyFrame = null;
     private volatile boolean suspendStream = false;
     private static final int SUSPEND_SLEEP_MS = 50;
+    // C5: set by the dedicated ControlSender thread when the control channel write fails; the
+    // media loop checks this and triggers the single errorDisconnect callback (so we never
+    // race two callbacks for the same disconnect).
+    private volatile boolean controlDisconnected = false;
 
 
     @Override
@@ -325,6 +330,7 @@ public class Scrcpy extends Service {
         DataOutputStream controlOutputStream = null;
         Socket mediaSocket = null;
         Socket controlSocket = null;
+        ControlSender controlSender = null;  // C5: dedicated control-send thread
         boolean firstConnect = true;
         int attempts = 50;
         int controlPort = port + 1;
@@ -370,8 +376,10 @@ public class Scrcpy extends Service {
                 }
                 Log.d("Scrcpy", "Received resolution data: " + bytesRead + " bytes");
                 
-                // 恢复无限等待模式，后续数据流需要持续读取
-                mediaSocket.setSoTimeout(0);
+                // C5: 100ms 读取超时替代不可靠的 available() 轮询。服务端静态画面时每 ~100ms
+                // 发一帧 repeat-frame，故 100ms 不会误判超时；size 头未读满时为良性超时（继续
+                // 循环保存已读字节），payload 中途超时则为死连接（断开重连）。
+                mediaSocket.setSoTimeout(100);
                 
                 attempts = 0;
                 for (int i = 0; i < remote_dev_resolution.length; i++) {
@@ -388,7 +396,11 @@ public class Scrcpy extends Service {
                 }
                 socket_status = true;
 
-                loop(mediaInputStream, controlOutputStream, delay);
+                // C5: controlOutputStream is now owned exclusively by the ControlSender thread,
+                // which runs concurrently with the media-only loop() below.
+                controlSender = new ControlSender(controlOutputStream);
+                controlSender.start();
+                loop(mediaInputStream, delay);
 
             } catch (Exception e) {
                 e.printStackTrace();
@@ -430,6 +442,15 @@ public class Scrcpy extends Service {
                 Log.e("Scrcpy", e.getMessage() != null ? e.getMessage() : e.toString());
                 Log.e("Scrcpy", "attempts--");
             } finally {
+                // C5: stop the control-send thread before closing its stream; take() throws
+                // InterruptedException on interrupt() → clean exit. join(500) bounds the wait.
+                if (controlSender != null) {
+                    controlSender.interrupt();
+                    try {
+                        controlSender.join(500);
+                    } catch (InterruptedException ignore) {
+                    }
+                }
                 if (controlSocket != null) {
                     try {
                         controlSocket.close();
@@ -467,7 +488,7 @@ public class Scrcpy extends Service {
 
     }
 
-    private void loop(DataInputStream mediaInputStream, DataOutputStream controlOutputStream, int delay) throws InterruptedException {
+    private void loop(DataInputStream mediaInputStream, int delay) throws InterruptedException {
         VideoPacket.StreamSettings streamSettings = null;
         byte[] packetSize = new byte[4];
 
@@ -477,194 +498,265 @@ public class Scrcpy extends Service {
         int videoPassCount = 0;
         int audioPassCount = 0;
 
-        while (LetServceRunning.get()) {
-            boolean waitEvent = true;
-            try {
-                if (!backgroundMode && pendingForegroundRefresh) {
-                    if (surface == null || !surface.isValid()) {
-                        try {
-                            Thread.sleep(5);
-                        } catch (InterruptedException ignore) {
-                        }
-                        continue;
-                    }
-                    if (cachedStreamSettings != null) {
-                        streamSettings = cachedStreamSettings;
-                        videoDecoder.configure(surface, screenWidth, screenHeight,
-                                streamSettings.sps, streamSettings.pps);
-                        if (cachedKeyFrame != null) {
-                            VideoPacket key = VideoPacket.readHead(cachedKeyFrame);
-                            videoDecoder.decodeSample(cachedKeyFrame, VideoPacket.getHeadLen(),
-                                    cachedKeyFrame.length - VideoPacket.getHeadLen(),
-                                    0, key.flag.getFlag());
-                        }
-                    }
-                    pendingForegroundRefresh = false;
-                }
-                byte[] sendevent = event.poll();
-                if (sendevent != null) {
-                    waitEvent = false;
-                    try {
-                        controlOutputStream.write(sendevent, 0, sendevent.length);
-                        controlOutputStream.flush();  // 确保数据立即发送，避免缓冲延迟
-                    } catch (IOException e) {
-                        Log.e("Scrcpy", "Control channel write failed, disconnecting", e);
-                        if (serviceCallbacks != null) {
-                            serviceCallbacks.errorDisconnect();
-                        }
-                        LetServceRunning.set(false);
-                    } finally {
-                        // event = null;
-                    }
-                }
+        // C5: partial-preserving position in the 4-byte size header. Declared OUTSIDE the
+        // size-read try so a benign SocketTimeoutException (static screen / suspend) does not
+        // lose already-read bytes: on timeout we continue the outer loop with sizeRead intact.
+        int sizeRead = 0;
 
-                if (suspendStream) {
+        while (LetServceRunning.get()) {
+            // === bookkeeping（每次迭代都执行，包括良性读超时之后）===
+            // C5: ControlSender 线程独占 controlOutputStream；若其写失败会置此 flag，由此媒体循环
+            // 统一发起 errorDisconnect 回调（避免两个回调竞态）。
+            if (controlDisconnected) {
+                if (serviceCallbacks != null) {
+                    serviceCallbacks.errorDisconnect();
+                }
+                LetServceRunning.set(false);
+                break;
+            }
+            if (!backgroundMode && pendingForegroundRefresh) {
+                if (surface == null || !surface.isValid()) {
                     try {
-                        Thread.sleep(SUSPEND_SLEEP_MS);
+                        Thread.sleep(5);
+                    } catch (InterruptedException ignore) {
+                    }
+                    continue;
+                }
+                if (cachedStreamSettings != null) {
+                    streamSettings = cachedStreamSettings;
+                    videoDecoder.configure(surface, screenWidth, screenHeight,
+                            streamSettings.sps, streamSettings.pps);
+                    if (cachedKeyFrame != null) {
+                        VideoPacket key = VideoPacket.readHead(cachedKeyFrame);
+                        videoDecoder.decodeSample(cachedKeyFrame, VideoPacket.getHeadLen(),
+                                cachedKeyFrame.length - VideoPacket.getHeadLen(),
+                                0, key.flag.getFlag());
+                    }
+                }
+                pendingForegroundRefresh = false;
+            }
+            if (suspendStream) {
+                try {
+                    Thread.sleep(SUSPEND_SLEEP_MS);
+                } catch (InterruptedException ignore) {
+                }
+                continue;
+            }
+
+            // === size 头：状态化、保留已读字节（100ms SoTimeout）===
+            // SocketInputStream.read 要么返回 >=1 字节，要么抛 SocketTimeoutException 且 0 字节已传，
+            // 故 sizeRead 不会被超时破坏；超时时 continue 外层循环，sizeRead 保持不变。
+            int size;
+            try {
+                while (sizeRead < 4) {
+                    int n = mediaInputStream.read(packetSize, sizeRead, 4 - sizeRead);
+                    if (n < 0) {
+                        throw new IOException("Connection closed while reading packet size");
+                    }
+                    sizeRead += n;
+                }
+                size = ByteUtils.bytesToInt(packetSize);
+                sizeRead = 0; // reset for the next packet
+            } catch (SocketTimeoutException ste) {
+                // 100ms 未读满 size 头：静态画面 / suspend / 链路慢。良性——继续循环（上方 bookkeeping 重跑），sizeRead 保留。
+                continue;
+            } catch (IOException e) {
+                Log.e("Scrcpy", "IOException reading size: " + e.getMessage());
+                e.printStackTrace();
+                if (serviceCallbacks != null) {
+                    serviceCallbacks.errorDisconnect();
+                }
+                LetServceRunning.set(false);
+                break;
+            }
+
+            if (size <= 0 || size > 4 * 1024 * 1024) {  // 如果单个数据包大小异常，直接断开连接
+                StringBuilder hex = new StringBuilder(11);
+                for (int i = 0; i < 4; i++) {
+                    int v = packetSize[i] & 0xFF;
+                    if (i > 0) {
+                        hex.append(' ');
+                    }
+                    if (v < 0x10) {
+                        hex.append('0');
+                    }
+                    hex.append(Integer.toHexString(v));
+                }
+                Log.e("Scrcpy", "Invalid packet size=" + size + " header=" + hex);
+                if (serviceCallbacks != null) {
+                    serviceCallbacks.errorDisconnect();
+                }
+                LetServceRunning.set(false);
+                break;
+            }
+
+            // === payload + decode：payload 中途 SocketTimeout = 死连接 ===
+            // readFully 中途超时会丢弃已读字节导致流错位，故视为硬断开（非良性）。
+            try {
+                byte[] packet = new byte[size];
+                mediaInputStream.readFully(packet, 0, size);
+
+                if (backgroundMode) {
+                    if (MediaPacket.Type.getType(packet[0]) == MediaPacket.Type.VIDEO) {
+                        VideoPacket videoPacket = VideoPacket.readHead(packet);
+                        if (videoPacket.flag == VideoPacket.Flag.CONFIG) {
+                            int dataLength = packet.length - VideoPacket.getHeadLen();
+                            byte[] data = new byte[dataLength];
+                            System.arraycopy(packet, VideoPacket.getHeadLen(), data, 0, dataLength);
+                            VideoPacket.StreamSettings settings = VideoPacket.getStreamSettings(data);
+                            if (settings != null && settings.sps != null && settings.pps != null) {
+                                cachedStreamSettings = settings;
+                            }
+                        } else if (videoPacket.flag == VideoPacket.Flag.KEY_FRAME) {
+                            cachedKeyFrame = packet;
+                        }
+                    }
+                    try {
+                        Thread.sleep(BACKGROUND_SLEEP_MS);
                     } catch (InterruptedException ignore) {
                     }
                     continue;
                 }
 
-                if (mediaInputStream.available() > 0) {
-                    waitEvent = false;
-                    mediaInputStream.readFully(packetSize, 0, 4);
-                    int size = ByteUtils.bytesToInt(packetSize);
-                    if (size <= 0 || size > 4 * 1024 * 1024) {  // 如果单个数据包大小异常，直接断开连接
-                        StringBuilder hex = new StringBuilder(11);
-                        for (int i = 0; i < 4; i++) {
-                            int v = packetSize[i] & 0xFF;
-                            if (i > 0) {
-                                hex.append(' ');
+                if (MediaPacket.Type.getType(packet[0]) == MediaPacket.Type.VIDEO) {
+                    VideoPacket videoPacket = VideoPacket.readHead(packet);
+                    // byte[] data = videoPacket.data;
+                    if (videoPacket.flag == VideoPacket.Flag.CONFIG || updateAvailable.get()) {
+                        if (!updateAvailable.get()) {
+                            int dataLength = packet.length - VideoPacket.getHeadLen();
+                            byte[] data = new byte[dataLength];
+                            System.arraycopy(packet, VideoPacket.getHeadLen(), data, 0, dataLength);
+                            streamSettings = VideoPacket.getStreamSettings(data);
+                            if (streamSettings == null || streamSettings.sps == null || streamSettings.pps == null) {
+                                Log.w("Scrcpy", "Video CONFIG parse failed, len=" + dataLength);
                             }
-                            if (v < 0x10) {
-                                hex.append('0');
-                            }
-                            hex.append(Integer.toHexString(v));
-                        }
-                        Log.e("Scrcpy", "Invalid packet size=" + size + " header=" + hex);
-                        if (serviceCallbacks != null) {
-                            serviceCallbacks.errorDisconnect();
-                        }
-                        LetServceRunning.set(false);
-                        return;
-                    }
-                    if (backgroundMode) {
-                        byte[] packet = new byte[size];
-                        mediaInputStream.readFully(packet, 0, size);
-                        if (MediaPacket.Type.getType(packet[0]) == MediaPacket.Type.VIDEO) {
-                            VideoPacket videoPacket = VideoPacket.readHead(packet);
-                            if (videoPacket.flag == VideoPacket.Flag.CONFIG) {
-                                int dataLength = packet.length - VideoPacket.getHeadLen();
-                                byte[] data = new byte[dataLength];
-                                System.arraycopy(packet, VideoPacket.getHeadLen(), data, 0, dataLength);
-                                VideoPacket.StreamSettings settings = VideoPacket.getStreamSettings(data);
-                                if (settings != null && settings.sps != null && settings.pps != null) {
-                                    cachedStreamSettings = settings;
+                            if (!first_time) {
+                                if (serviceCallbacks != null) {
+                                    serviceCallbacks.loadNewRotation();
                                 }
-                            } else if (videoPacket.flag == VideoPacket.Flag.KEY_FRAME) {
-                                cachedKeyFrame = packet;
+                                while (!updateAvailable.get()) {
+                                    // Waiting for new surface
+                                    try {
+                                        Thread.sleep(100);
+                                    } catch (InterruptedException e) {
+                                        e.printStackTrace();
+                                    }
+                                }
+
                             }
                         }
-                        try {
-                            Thread.sleep(BACKGROUND_SLEEP_MS);
-                        } catch (InterruptedException ignore) {
+                        updateAvailable.set(false);
+                        if (streamSettings != null && streamSettings.sps != null && streamSettings.pps != null) {
+                            videoDecoder.configure(surface, screenWidth, screenHeight, streamSettings.sps, streamSettings.pps);
                         }
+                    } else if (videoPacket.flag == VideoPacket.Flag.END) {
+                        // need close stream
+                        Log.e("Scrcpy", "END ... ");
+                    } else {
+                        // Log.e("Scrcpy", "videoPacket presentationTimeStamp ... " + videoPacket.presentationTimeStamp);
+                        // 帧在 100 ms 以内
+                        if (lastVideoOffset == 0) {
+                            lastVideoOffset = System.currentTimeMillis() - (videoPacket.presentationTimeStamp / 1000);
+                        }
+                        if (videoPacket.flag == VideoPacket.Flag.KEY_FRAME) {
+                            // C3: 传入真实 PTS（从 8 字节头解析），使 queueInputBuffer/Surface 渲染时间戳正确。
+                            videoDecoder.decodeSample(packet, VideoPacket.getHeadLen(), packet.length - VideoPacket.getHeadLen(),
+                                    videoPacket.presentationTimeStamp, videoPacket.flag.getFlag());
+                        } else {
+                            if (System.currentTimeMillis() - (lastVideoOffset + (videoPacket.presentationTimeStamp / 1000)) < delay) {
+                                videoPassCount = 0;
+                                videoDecoder.decodeSample(packet, VideoPacket.getHeadLen(), packet.length - VideoPacket.getHeadLen(),
+                                        videoPacket.presentationTimeStamp, videoPacket.flag.getFlag());
+                            } else {
+                                videoPassCount++;
+                            }
+                        }
+                    }
+                    first_time = false;
+                } else if (MediaPacket.Type.getType(packet[0]) == MediaPacket.Type.AUDIO) {
+                    if (!audioEnabled || audioDecoder == null) {
                         continue;
                     }
-                    byte[] packet = new byte[size];
-                    mediaInputStream.readFully(packet, 0, size);
-                    if (MediaPacket.Type.getType(packet[0]) == MediaPacket.Type.VIDEO) {
-                        VideoPacket videoPacket = VideoPacket.readHead(packet);
-                        // byte[] data = videoPacket.data;
-                        if (videoPacket.flag == VideoPacket.Flag.CONFIG || updateAvailable.get()) {
-                            if (!updateAvailable.get()) {
-                                int dataLength = packet.length - VideoPacket.getHeadLen();
-                                byte[] data = new byte[dataLength];
-                                System.arraycopy(packet, VideoPacket.getHeadLen(), data, 0, dataLength);
-                                streamSettings = VideoPacket.getStreamSettings(data);
-                                if (streamSettings == null || streamSettings.sps == null || streamSettings.pps == null) {
-                                    Log.w("Scrcpy", "Video CONFIG parse failed, len=" + dataLength);
-                                }
-                                if (!first_time) {
-                                    if (serviceCallbacks != null) {
-                                        serviceCallbacks.loadNewRotation();
-                                    }
-                                    while (!updateAvailable.get()) {
-                                        // Waiting for new surface
-                                        try {
-                                            Thread.sleep(100);
-                                        } catch (InterruptedException e) {
-                                            e.printStackTrace();
-                                        }
-                                    }
-
-                                }
-                            }
-                            updateAvailable.set(false);
-                            if (streamSettings != null && streamSettings.sps != null && streamSettings.pps != null) {
-                                videoDecoder.configure(surface, screenWidth, screenHeight, streamSettings.sps, streamSettings.pps);
-                            }
-                        } else if (videoPacket.flag == VideoPacket.Flag.END) {
-                            // need close stream
-                            Log.e("Scrcpy", "END ... ");
-                        } else {
-                            // Log.e("Scrcpy", "videoPacket presentationTimeStamp ... " + videoPacket.presentationTimeStamp);
-                            // 帧在 100 ms 以内
-                            if (lastVideoOffset == 0) {
-                                lastVideoOffset = System.currentTimeMillis() - (videoPacket.presentationTimeStamp / 1000);
-                            }
-                            if (videoPacket.flag == VideoPacket.Flag.KEY_FRAME) {
-                                videoDecoder.decodeSample(packet, VideoPacket.getHeadLen(), packet.length - VideoPacket.getHeadLen(),
-                                        0, videoPacket.flag.getFlag());
-                            } else {
-                                if (System.currentTimeMillis() - (lastVideoOffset + (videoPacket.presentationTimeStamp / 1000)) < delay) {
-                                    videoPassCount = 0;
-                                    videoDecoder.decodeSample(packet, VideoPacket.getHeadLen(), packet.length - VideoPacket.getHeadLen(),
-                                            0, videoPacket.flag.getFlag());
-                                } else {
-                                    videoPassCount++;
-                                }
-                            }
+                    AudioPacket audioPacket = AudioPacket.readHead(packet);
+                    // byte[] data = audioPacket.data;
+                    if (audioPacket.flag == AudioPacket.Flag.CONFIG) {
+                        int dataLength = packet.length - AudioPacket.getHeadLen();
+                        byte[] data = new byte[dataLength];
+                        System.arraycopy(packet, AudioPacket.getHeadLen(), data, 0, dataLength);
+                        Log.d("Scrcpy", "Audio CONFIG len=" + dataLength);
+                        audioDecoder.configure(data);
+                    } else if (audioPacket.flag == AudioPacket.Flag.END) {
+                        // need close stream
+                        Log.e("Scrcpy", "Audio END ... ");
+                    } else {
+                        if (lastAudioOffset == 0) {
+                            lastAudioOffset = System.currentTimeMillis() - (audioPacket.presentationTimeStamp / 1000);
                         }
-                        first_time = false;
-                    } else if (MediaPacket.Type.getType(packet[0]) == MediaPacket.Type.AUDIO) {
-                        if (!audioEnabled || audioDecoder == null) {
-                            continue;
-                        }
-                        AudioPacket audioPacket = AudioPacket.readHead(packet);
-                        // byte[] data = audioPacket.data;
-                        if (audioPacket.flag == AudioPacket.Flag.CONFIG) {
-                            int dataLength = packet.length - AudioPacket.getHeadLen();
-                            byte[] data = new byte[dataLength];
-                            System.arraycopy(packet, AudioPacket.getHeadLen(), data, 0, dataLength);
-                            Log.d("Scrcpy", "Audio CONFIG len=" + dataLength);
-                            audioDecoder.configure(data);
-                        } else if (audioPacket.flag == AudioPacket.Flag.END) {
-                            // need close stream
-                            Log.e("Scrcpy", "Audio END ... ");
+                        if (System.currentTimeMillis() - (lastAudioOffset + (audioPacket.presentationTimeStamp / 1000)) < delay) {
+                            audioPassCount = 0;
+                            // C3: 传入真实 PTS（headlen 复用 VideoPacket 的，两者皆为 10，行为不变）。
+                            audioDecoder.decodeSample(packet, VideoPacket.getHeadLen(), packet.length - AudioPacket.getHeadLen(),
+                                    audioPacket.presentationTimeStamp, audioPacket.flag.getFlag());
                         } else {
-                            if (lastAudioOffset == 0) {
-                                lastAudioOffset = System.currentTimeMillis() - (audioPacket.presentationTimeStamp / 1000);
-                            }
-                            if (System.currentTimeMillis() - (lastAudioOffset + (audioPacket.presentationTimeStamp / 1000)) < delay) {
-                                audioPassCount = 0;
-                                audioDecoder.decodeSample(packet, VideoPacket.getHeadLen(), packet.length - AudioPacket.getHeadLen(),
-                                        0, audioPacket.flag.getFlag());
-                            } else {
-                                audioPassCount++;
-                            }
+                            audioPassCount++;
                         }
                     }
-
                 }
+            } catch (SocketTimeoutException ste) {
+                // payload 中途超时：readFully 丢弃了部分字节，流已错位 → 死连接
+                Log.e("Scrcpy", "SocketTimeout mid-payload (dead connection): " + ste.getMessage());
+                if (serviceCallbacks != null) {
+                    serviceCallbacks.errorDisconnect();
+                }
+                LetServceRunning.set(false);
+                break;
             } catch (IOException e) {
                 Log.e("Scrcpy", "IOException: " + e.getMessage());
                 e.printStackTrace();
-            } finally {
-                if (waitEvent) {
-                    Thread.sleep(5);
+                if (serviceCallbacks != null) {
+                    serviceCallbacks.errorDisconnect();
                 }
+                LetServceRunning.set(false);
+                break;
+            }
+        }
+    }
+
+    /**
+     * 独立控制发送线程（C5）。
+     * <p>
+     * 独占 control {@link DataOutputStream}：在线程安全的 {@link #event} 队列上 take() 阻塞，
+     * 直至 UI 线程入队一个触摸/按键事件，然后 write+flush 20 字节控制消息。把控制发送与媒体接收解耦，
+     * 使慢速媒体读取不再拖延触控输入。
+     * <p>
+     * 写失败时置 {@link #controlDisconnected}（媒体循环据此发起唯一的 errorDisconnect 回调）并退出。
+     * 由 {@link #startConnection} 的 finally 块以 interrupt() 关停（take() 抛 InterruptedException → 干净退出）。
+     */
+    private class ControlSender extends Thread {
+        private final DataOutputStream controlOutputStream;
+
+        ControlSender(DataOutputStream controlOutputStream) {
+            super("scrcpy-control-sender");
+            this.controlOutputStream = controlOutputStream;
+        }
+
+        @Override
+        public void run() {
+            try {
+                while (!isInterrupted()) {
+                    byte[] sendevent = event.take(); // 阻塞直到入队事件
+                    try {
+                        controlOutputStream.write(sendevent, 0, sendevent.length);
+                        controlOutputStream.flush();  // 确保数据立即发送，避免缓冲延迟
+                    } catch (IOException e) {
+                        Log.e("Scrcpy", "Control channel write failed, disconnecting", e);
+                        // 通知媒体循环重连；errorDisconnect 由它统一发起，避免两个回调竞态。
+                        controlDisconnected = true;
+                        break;
+                    }
+                }
+            } catch (InterruptedException e) {
+                // 关停期间在 take() 中被中断 —— 干净退出
             }
         }
     }

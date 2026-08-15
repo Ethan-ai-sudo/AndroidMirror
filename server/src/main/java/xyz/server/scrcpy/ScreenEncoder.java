@@ -8,6 +8,7 @@ import android.media.MediaFormat;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.Surface;
 
@@ -32,6 +33,12 @@ public class ScreenEncoder implements Device.RotationListener {
 
     private static final int MICROSECONDS_IN_ONE_SECOND = 1_000_000;
 
+    // Downscale-on-error fallback chain (descending). When encoding fails before the first
+    // frame is produced, the encoder retries with a smaller max size walked from this list.
+    // Keep the values in descending order.
+    private static final int[] MAX_SIZE_FALLBACK = {2560, 1920, 1600, 1280, 1024, 800};
+    private static final int MAX_CONSECUTIVE_ERRORS = 3;
+
     private final AtomicBoolean rotationChanged = new AtomicBoolean();
     private final AtomicBoolean paused = new AtomicBoolean(false);
     private final Object pauseLock = new Object();
@@ -41,6 +48,11 @@ public class ScreenEncoder implements Device.RotationListener {
     private int frameRate;
     private int iFrameInterval;
     private boolean audioEnabled = true;
+
+    // Set to true once the first non-CONFIG frame is produced; drives the downscale-on-error
+    // policy (downsizing is only attempted before the first frame, matching upstream scrcpy).
+    private boolean firstFrameSent;
+    private int consecutiveErrors;
 
     public ScreenEncoder(int bitRate, int frameRate, int iFrameInterval) {
         this.bitRate = bitRate;
@@ -67,10 +79,22 @@ public class ScreenEncoder implements Device.RotationListener {
         format.setInteger(MediaFormat.KEY_BIT_RATE, bitRate);
         format.setInteger(MediaFormat.KEY_FRAME_RATE, frameRate);
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            // limited color range (16-235), matches most H.264 content and avoids washed-out colors
+            format.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED);
+        }
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameInterval);
 
         // display the very first frame, and recover from bad quality when no new frames
         format.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, MICROSECONDS_IN_ONE_SECOND * REPEAT_FRAME_DELAY / frameRate); // µs
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            // real-time priority
+            format.setInteger(MediaFormat.KEY_PRIORITY, 0);
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // output 1 frame as soon as 1 frame is queued (low-latency)
+            format.setInteger(MediaFormat.KEY_LATENCY, 1);
+        }
         return format;
     }
 
@@ -170,14 +194,14 @@ public class ScreenEncoder implements Device.RotationListener {
         MediaFormat format = createFormat(bitRate, frameRate, iFrameInterval);
         device.setRotationListener(this);
         boolean alive;
-        int errorCount = 0;
         ScreenCapture capture = new ScreenCapture(device);
         try {
             do {
                 MediaCodec codec = createCodec();
 //                IBinder display = createDisplay();
 //                Rect deviceRect = device.getScreenInfo().getDeviceSize().toRect();
-                Rect videoRect = device.getScreenInfo().getVideoSize().toRect();
+                Size videoSize = device.getScreenInfo().getVideoSize();
+                Rect videoRect = videoSize.toRect();
                 setSize(format, videoRect.width(), videoRect.height());
                 configure(codec, format);
                 Surface surface = null;
@@ -190,13 +214,10 @@ public class ScreenEncoder implements Device.RotationListener {
                     codec.start();
 
                     alive = encode(codec, outputStream);
-                    errorCount = 0;
                 } catch (IllegalStateException | IllegalArgumentException e) {
                     Ln.e("Encoding error: " + e.getClass().getName(), e);
-                    if (errorCount > 3) {
+                    if (!prepareRetry(device, videoSize)) {
                         throw e;
-                    } else {
-                        errorCount++;
                     }
                     Ln.i("Retrying...");
                     alive = true;
@@ -215,6 +236,76 @@ public class ScreenEncoder implements Device.RotationListener {
             capture.release();
             // device.setRotationListener(null);
         }
+    }
+
+    /**
+     * Choose a smaller max size from the {@link #MAX_SIZE_FALLBACK} chain for a retry, given the
+     * video size that just failed to encode.
+     * <p>
+     * Mirrors upstream scrcpy's {@code SurfaceEncoder.chooseMaxSizeFallback()}: returns the first
+     * (largest) fallback value strictly smaller than the major side of the failed size, or {@code 0}
+     * if the chain is exhausted.
+     *
+     * @param failedSize the video size that failed to encode
+     * @return a smaller max size to retry with, or {@code 0} to give up
+     */
+    private static int chooseMaxSizeFallback(Size failedSize) {
+        int currentMaxSize = Math.max(failedSize.getWidth(), failedSize.getHeight());
+        for (int value : MAX_SIZE_FALLBACK) {
+            if (value < currentMaxSize) {
+                // Found a smaller value to reduce the video size
+                return value;
+            }
+        }
+        // No fallback, fail definitively
+        return 0;
+    }
+
+    /**
+     * Decide whether to retry encoding after an error, possibly after reducing the video size.
+     * <p>
+     * Mirrors upstream scrcpy's {@code SurfaceEncoder.prepareRetry()} policy:
+     * <ul>
+     *   <li>after the first frame is produced, the size is no longer changed (downsizing later
+     *       could be surprising to the viewer): the encoder retries a few times at the same size,
+     *       then definitively fails;</li>
+     *   <li>before the first frame, an encoding error triggers an immediate downscale through the
+     *       {@link #MAX_SIZE_FALLBACK} chain until a size works or the chain is exhausted.</li>
+     * </ul>
+     * Only {@code videoSize} shrinks (the physical device size — and therefore the 8-byte
+     * resolution preamble already sent to the client — is unchanged); the new dimensions are
+     * carried to the client in the next SPS/PPS CONFIG packet.
+     *
+     * @param device      the device, reconfigured with a smaller max size when downsizing
+     * @param currentSize the video size that just failed to encode
+     * @return {@code true} to retry (the caller re-enters the do-while loop), {@code false} to give up
+     */
+    private boolean prepareRetry(Device device, Size currentSize) {
+        if (firstFrameSent) {
+            // Already produced a frame: do not change the size, just retry a few times
+            ++consecutiveErrors;
+            if (consecutiveErrors < MAX_CONSECUTIVE_ERRORS) {
+                // Wait a bit to increase the probability that retrying will fix the problem
+                SystemClock.sleep(50);
+                return true;
+            }
+            // Definitively fail
+            return false;
+        }
+
+        // No frame produced yet: downscale through the fallback chain
+        int newMaxSize = chooseMaxSizeFallback(currentSize);
+        if (newMaxSize == 0) {
+            // No smaller size available, fail definitively
+            return false;
+        }
+
+        // Recompute the screen info with the smaller max size; only videoSize shrinks (the physical
+        // device size, and therefore the 8-byte resolution preamble already sent, is unchanged). The
+        // new dimensions are carried to the client in the next SPS/PPS CONFIG packet.
+        Ln.i("Encoding failed before first frame, retrying with max size " + newMaxSize + "...");
+        device.recomputeScreenInfo(newMaxSize);
+        return true;
     }
 
     public static String buildDisplayListMessage() {
@@ -321,6 +412,11 @@ public class ScreenEncoder implements Device.RotationListener {
                         } else if (bufferInfo.flags == 0) {
                             flag = VideoPacket.Flag.FRAME;
                         }
+                        // A non-CONFIG buffer reached here (CONFIG buffers are continued above), so a
+                        // real frame is being produced: mark first-frame sent and reset the consecutive
+                        // error counter, mirroring upstream SurfaceEncoder.encode() (lines 263-267).
+                        firstFrameSent = true;
+                        consecutiveErrors = 0;
                         VideoPacket packet = new VideoPacket(type, flag, bufferInfo.presentationTimeUs, b);
                         synchronized (outputStream) {
                             outputStream.write(packet.toByteArray());

@@ -5,6 +5,7 @@ import android.media.MediaFormat;
 import android.util.Log;
 import android.view.Surface;
 
+import xyz.aicy.scrcpy.model.VideoPacket;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -17,6 +18,11 @@ public class VideoDecoder {
     private Worker mWorker;
     private AtomicBoolean mIsConfigured = new AtomicBoolean(false);
     private static final int SAMPLE_QUEUE_CAPACITY = 30;
+    // C1: output-dequeue timeout. Finite (not -1) so the loop wakes to re-poll the sample queue
+    // and feed the next frame even when the in-flight pipeline is momentarily empty (e.g. between
+    // repeat frames on a static screen); finite (not 0) so the thread does not busy-spin. 10ms is
+    // upstream scrcpy's drain value.
+    private static final long OUTPUT_BUFFER_TIMEOUT_US = 10_000L;
 
     public void decodeSample(byte[] data, int offset, int size, long presentationTimeUs, int flags) {
         if (mWorker != null) {
@@ -97,9 +103,18 @@ public class VideoDecoder {
                 return;
             }
             Sample sample = new Sample(data, offset, size, presentationTimeUs, flags);
-            if (!sampleQueue.offer(sample)) {
-                // Drop oldest frame to keep latency low
-                sampleQueue.poll();
+            // C2: a keyframe must always be delivered (it resyncs the stream); if the queue is
+            // full, evict the oldest entry to make room. A P-frame that arrives on a full queue is
+            // discarded (drop-newest): the contiguous run already queued stays decodable (each
+            // P-frame depends on its predecessor), which avoids decode artifacts from a broken
+            // dependency chain. CONFIG(2)/END(4) never reach here (routed to configure()/loop).
+            if (flags == VideoPacket.Flag.KEY_FRAME.getFlag()) {
+                if (!sampleQueue.offer(sample)) {
+                    sampleQueue.poll();
+                    sampleQueue.offer(sample);
+                }
+            } else {
+                // Drop-newest: offer returns false if full → the incoming P-frame is discarded.
                 sampleQueue.offer(sample);
             }
         }
@@ -124,15 +139,20 @@ public class VideoDecoder {
                                     mCodec.queueInputBuffer(inputIndex, 0, pendingSample.size, pendingSample.presentationTimeUs, pendingSample.flags);
                                     pendingSample = null;
                                 }
-                            } else {
-                                try {
-                                    Thread.sleep(2);
-                                } catch (InterruptedException ignore) {
-                                }
                             }
+                            // C1: no Thread.sleep(2) on "no free input buffer" — draining output
+                            // (below) frees input buffers, and the blocking output dequeue yields
+                            // the CPU for up to OUTPUT_BUFFER_TIMEOUT_US.
                         }
 
-                        int outputIndex = mCodec.dequeueOutputBuffer(info, 0);
+                        // C1: block on output drain with a finite timeout (NOT -1, NOT 0):
+                        //  - 0 would busy-spin (the old behavior);
+                        //  - -1 would stall when the in-flight pipeline is empty (e.g. between
+                        //    repeat frames on a static screen: the thread blocks here with no
+                        //    input queued, so a newly-arrived frame can never be fed → freeze).
+                        // A finite timeout yields the CPU between frames yet wakes often enough to
+                        // re-poll the sample queue and feed the next frame.
+                        int outputIndex = mCodec.dequeueOutputBuffer(info, OUTPUT_BUFFER_TIMEOUT_US);
                         if (outputIndex >= 0) {
                             // setting true is telling system to render frame onto Surface
                             mCodec.releaseOutputBuffer(outputIndex, true);

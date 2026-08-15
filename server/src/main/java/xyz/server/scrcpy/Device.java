@@ -44,6 +44,20 @@ public final class Device {
         return screenInfo;
     }
 
+    /**
+     * Recompute the screen info with a new (smaller) max size.
+     * <p>
+     * Used by {@link ScreenEncoder} to downscale the video when encoding fails before the
+     * first frame is produced. The physical device size is unchanged (so the 8-byte resolution
+     * preamble already sent to the client still matches); only {@code videoSize} shrinks, and the
+     * new dimensions are carried to the client in the SPS/PPS CONFIG packet.
+     *
+     * @param maxSize the new max size (major side), a positive multiple of 8
+     */
+    public synchronized void recomputeScreenInfo(int maxSize) {
+        screenInfo = computeScreenInfo(maxSize);
+    }
+
     @SuppressWarnings("checkstyle:MagicNumber")
     private ScreenInfo computeScreenInfo(int maxSize) {
         // Compute the video size and the padding of the content inside this video.

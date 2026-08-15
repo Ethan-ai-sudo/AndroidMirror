@@ -22,6 +22,10 @@ public class AudioDecoder {
     private Worker mWorker;
     private AtomicBoolean mIsConfigured = new AtomicBoolean(false);
     private static final int SAMPLE_QUEUE_CAPACITY = 100;
+    // C1: output-dequeue timeout. Finite (not -1) so the loop wakes to re-poll the sample queue
+    // and feed the next frame even when the in-flight pipeline is momentarily empty; finite (not
+    // 0) so the thread does not busy-spin. 10ms is upstream scrcpy's drain value.
+    private static final long OUTPUT_BUFFER_TIMEOUT_US = 10_000L;
 
     private AudioTrack audioTrack;
     private final int SAMPLE_RATE = 48000;
@@ -136,11 +140,9 @@ public class AudioDecoder {
                 return;
             }
             Sample sample = new Sample(data, offset, size, presentationTimeUs, flags);
-            if (!sampleQueue.offer(sample)) {
-                // Drop oldest to keep audio in sync with video
-                sampleQueue.poll();
-                sampleQueue.offer(sample);
-            }
+            // C2: audio has no keyframe concept; on a full queue, drop the incoming (newest) to
+            // bound latency (offer returns false if full → the incoming sample is discarded).
+            sampleQueue.offer(sample);
         }
 
         @Override
@@ -163,15 +165,19 @@ public class AudioDecoder {
                                     mCodec.queueInputBuffer(inputIndex, 0, pendingSample.size, pendingSample.presentationTimeUs, pendingSample.flags);
                                     pendingSample = null;
                                 }
-                            } else {
-                                try {
-                                    Thread.sleep(2);
-                                } catch (InterruptedException ignore) {
-                                }
                             }
+                            // C1: no Thread.sleep(2) on "no free input buffer" — draining output
+                            // (below) frees input buffers, and the blocking output dequeue yields
+                            // the CPU for up to OUTPUT_BUFFER_TIMEOUT_US.
                         }
 
-                        int outputIndex = mCodec.dequeueOutputBuffer(info, 0);
+                        // C1: block on output drain with a finite timeout (NOT -1, NOT 0):
+                        //  - 0 would busy-spin (the old behavior);
+                        //  - -1 would stall when the in-flight pipeline is empty (the thread blocks
+                        //    here with no input queued, so a newly-arrived frame can never be fed).
+                        // A finite timeout yields the CPU between frames yet wakes often enough to
+                        // re-poll the sample queue and feed the next frame.
+                        int outputIndex = mCodec.dequeueOutputBuffer(info, OUTPUT_BUFFER_TIMEOUT_US);
                         // Log.e("Scrcpy", "Audio Decoder: " + outputIndex);
                         if (outputIndex >= 0) {
                             if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) == MediaCodec.BUFFER_FLAG_END_OF_STREAM) {
