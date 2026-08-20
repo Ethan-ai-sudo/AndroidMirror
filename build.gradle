@@ -4,8 +4,8 @@ buildscript {
 
     ext {
         agp_version = '8.6.0'
-        app_version = '1.5'
-        version_code = 28
+        app_version = '1.6'
+        version_code = 29
     }
     repositories {
         google()
