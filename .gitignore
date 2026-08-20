@@ -14,3 +14,5 @@ app/src/main/assets/scrcpy-server.jar
 scrcpy.jks.b64
 /scrcpy-master/
 /adbTools-main/
+# release 下载产物目录（非源码）
+/release/

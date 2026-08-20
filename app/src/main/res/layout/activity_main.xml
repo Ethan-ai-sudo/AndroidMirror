@@ -10,13 +10,7 @@
         android:layout_height="match_parent"
         android:contentDescription="@null"
         android:scaleType="centerCrop"
-        android:src="@drawable/bg_main" />
-
-    <View
-        android:id="@+id/main_background_overlay"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:background="#80000000" />
+        android:src="@drawable/bg_tech_blue" />
 
     <FrameLayout
         android:layout_width="match_parent"
@@ -35,7 +29,7 @@
             android:layout_gravity="center_vertical"
             android:fontFamily="sans-serif-medium"
             android:gravity="center_vertical"
-            android:text="DroidMirror"
+            android:text="AndroidRemote"
             android:textColor="@color/black"
             android:textSize="22sp"
             android:textStyle="bold" />

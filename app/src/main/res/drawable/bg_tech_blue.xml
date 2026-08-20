@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="1080dp"
+    android:height="1920dp"
+    android:viewportWidth="1080"
+    android:viewportHeight="1920">
+
+    <!-- 斜向深蓝→黑渐变背景 -->
+    <path android:pathData="M0,0 L1080,0 L1080,1920 L0,1920 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="0" android:startY="0"
+                android:endX="1080" android:endY="1920"
+                android:startColor="#0B1F3A"
+                android:centerColor="#071526"
+                android:endColor="#01040A" />
+        </aapt:attr>
+    </path>
+
+    <!-- 顶部辉光，营造动感科技氛围 -->
+    <path android:pathData="M0,0 L1080,0 L1080,540 L0,540 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="540" android:startY="0"
+                android:endX="540" android:endY="540"
+                android:startColor="#224A7A"
+                android:centerColor="#102843"
+                android:endColor="#00000000" />
+        </aapt:attr>
+    </path>
+
+    <!-- 科技网格线（竖向，每 120 单位） -->
+    <path
+        android:pathData="M0,0L0,1920 M120,0L120,1920 M240,0L240,1920 M360,0L360,1920 M480,0L480,1920 M600,0L600,1920 M720,0L720,1920 M840,0L840,1920 M960,0L960,1920 M1080,0L1080,1920"
+        android:strokeColor="#15355A"
+        android:strokeWidth="1.5" />
+
+    <!-- 科技网格线（横向，每 120 单位） -->
+    <path
+        android:pathData="M0,0L1080,0 M0,120L1080,120 M0,240L1080,240 M0,360L1080,360 M0,480L1080,480 M0,600L1080,600 M0,720L1080,720 M0,840L1080,840 M0,960L1080,960 M0,1080L1080,1080 M0,1200L1080,1200 M0,1320L1080,1320 M0,1440L1080,1440 M0,1560L1080,1560 M0,1680L1080,1680 M0,1800L1080,1800 M0,1920L1080,1920"
+        android:strokeColor="#15355A"
+        android:strokeWidth="1.5" />
+
+    <!-- 动感斜向高光线 -->
+    <path
+        android:pathData="M-100,200 L400,-100"
+        android:strokeColor="#2A6BB0"
+        android:strokeWidth="2.5" />
+    <path
+        android:pathData="M1180,1720 L680,2020"
+        android:strokeColor="#2A6BB0"
+        android:strokeWidth="2.5" />
+
+</vector>
